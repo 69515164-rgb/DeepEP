@@ -534,15 +534,9 @@ flowchart TD
 生效点：    下一集体 L2 展开时，同一张算法图换各 VT 的连续字节区间
 ```
 
-是的：一次集体一旦 `Commit`，本 CCT 的切分就冻死。生产默认按 **训练 step** 收口，不要求框架再单独 Host 下发一张表。
+一次集体 `Commit` 之后，**当前算法拍**的切分冻死；不是整次 AllReduce 都不能再改。若问的是 Ring/HD 内部的 step i → step i+1，见 3.6。
 
-**推荐：step i 的本地 HCCL 调用内做完检测和改表，step i+1 的本地 HCCL 调用 Prepare 读新表生效。**
-
-```text
-同一次 HcclAllReduce 调用内、Commit 之后     不可能改本 CCT（已发 WQE / 算法边都不动）
-step i 这次调用的 Wait 之后、返回用户之前    检测收口 + Allocator 写 tile→VT_{i+1}
-step i+1 这次调用的 Prepare                 本地读表，按新区间展开 —— 生效点
-```
+跨集体、按训练 step 收口时：step i 的本地调用 `Wait` 后写表，step i+1 的 Prepare 生效，框架不必再单独 Host 下发。
 
 不需要框架在两个 step 之间再调一次「下发表」的 Host API。表放在 Device 可见内存，Allocator 是确定性纯函数：stall 已随 step i 的集体同步捎带对齐，各 rank 在本地就能算出同一张 `tile→VT_{i+1}`。图 C 黄块里的小 AllReduce 只在捎带还不够全局可见时才要；能捎带就省略。
 
@@ -644,12 +638,95 @@ sequenceDiagram
 
 | 动作 | 层 | 何时 | 不做什么 |
 | --- | --- | --- | --- |
-| 写/换 tile→VT | L0 | 集体边界 | 不在 CCT 中途改表 |
+| 写/换 tile→VT | L0 / L2 | 集体边界，或算法拍边界（3.6） | 不在同一拍、已发 WQE 上改表 |
 | 展开、挂 Tile、poll stall | L2 | CCT 内 | 不从 AIC 自定义核改 Jetty |
 | 下 TS 任务 | L3 | CCT 内 | 不一条任务喷多 Jetty |
 | doorbell / 传包 | L4 L5 | CCT 内 | 不改已发 WQE、不 Jetty 内喷包 |
 | 收齐、原语义 reduce | L6 | CCT 内 | 不换算法图 |
 | 算 T_hat、L1/L2 切分 | L0 | 集体后 | `stream_stall` 单独涨则冻权重 |
+
+### 3.6 同一次集体内部：Ring / HD 的算法拍
+
+这里的 step 是 **一次 AllReduce 算法内部的拍**，不是训练 step。
+
+- Ring AllReduce：ReduceScatter `N-1` 拍 + AllGather `N-1` 拍，每拍对端不变（仍是 ring next/prev），只换这块 chunk。
+- HD（Halving-Doubling）：`log N` 拍 RS + `log N` 拍 AG，**每拍换对端**（distance 加倍）。
+
+**可以：step i 收齐本拍、算出下一拍的 `tile→VT`，同一次 `HcclAllReduce` 里的 step i+1 按新区间下 WQE。** 仍不动算法：邻居、HD 对端序列、拍数、VT↔Jetty 都不改。
+
+AI CPU 模式天然就是
+
+```text
+for step in 0 .. S-1:
+    按当前 tile→VT 给本拍各 VT 下 WQE
+    等本拍全部 CQE
+    用本拍 stall 算下一拍切分    # 插入点
+```
+
+拍间本来就有「收齐再发下一拍」的软件屏障，Allocator 挂在这里，不必等整次集体 `Wait`，也不必再走 Host。
+
+```text
+同拍内、已 doorbell 的 WQE     不改
+step i 全部 CQE 收齐之后       检测 + 算 tile→VT_{i+1}
+step i+1 开始下 WQE 之前       生效（本拍对端的收发双方对齐长度表）
+```
+
+**图 D：一次 AllReduce 内，算法拍 i → 拍 i+1**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant App as 训练框架
+  participant CPU as L2 AI CPU<br/>HCCL 服务端
+  participant VT as VT/Jetty 0..K
+  participant Peer as 本拍对端
+
+  App->>CPU: 一次 HcclAllReduce（Ring 或 HD）
+  Note over CPU: 算法图冻结：谁在哪一拍跟谁说话 不改
+
+  rect rgb(236, 242, 248)
+    Note over CPU,Peer: 算法拍 i：只用 tile→VT_i
+    CPU->>VT: 本拍 chunk 按 VT_i 切成连续区间
+    VT->>Peer: 下 WQE 并传完
+    Peer-->>CPU: 本拍全部 CQE
+    CPU->>CPU: 记 sq_stall / cq_stall / bytes_done
+  end
+
+  rect rgb(255, 243, 205)
+    Note over CPU,Peer: 拍间屏障：本拍 WQE 已全部完成<br/>仍在同一次 AllReduce 调用内
+    CPU->>Peer: 尾包捎带下一拍权重 w_i+1
+    Peer-->>CPU: 对端确认（或对称各算各的，公式相同）
+    CPU->>CPU: Allocator 只改下一拍各 VT 的连续 Tile<br/>慢 VT 尾部划给快 VT
+  end
+
+  rect rgb(236, 248, 236)
+    Note over CPU,Peer: 算法拍 i+1：同一套邻居/对端序列，新切分
+    CPU->>VT: 下一拍 chunk 按 tile→VT_i+1 下 WQE
+    VT->>Peer: 仍是原 Jetty，只是各口字节多少变了
+    Peer-->>CPU: 拍 i+1 CQE
+  end
+
+  CPU-->>App: 整次 AllReduce Wait 返回
+```
+
+**Ring 和 HD 能不能逐拍切，不一样。**
+
+| | Ring | HD |
+| --- | --- | --- |
+| 相邻两拍对端 | 不变（next/prev） | 变（`rank XOR 2^i`） |
+| step i 的 stall 对 step i+1 | 同一条路径，可直接用来切下一拍 | 路径换了，**不能**把对端 A 的 stall 当对端 B 的逐 VT 权重 |
+| 推荐 | 大消息可逐拍切 | 默认只在 **RS→AG 相变**切一次；Port 级 L2 权重可以跨拍留下 |
+| 收发对齐 | 本拍对端一对：尾包带 `w_{i+1}`，双方按同一公式挂下一拍长度 | 相变处环上已有自然同步，再切一次即可 |
+
+硬条件：
+
+1. **拍间必须收齐。** 若 HCCL 把 hop i+1 的发送和 hop i 的接收重叠，必须关掉重叠，或改为每 K 拍、或只在 RS/AG 相变处切。没有屏障就没有「step i+1 生效」。
+2. **只切本拍还没下的 chunk。** 已完成的拍、已发 WQE 不动。算法边不动。
+3. **下一拍的收发长度表要对齐。** Jetty 上 RTP/UB 的 recv WQE 带长度。step i 尾包捎带 `w_{i+1}`（或双方用同一 stall 公式本地算）。不要为此做一次全局小 AllReduce——那会比一拍还贵。
+4. **拍要够长。** 小消息一拍只有几十微秒，Allocator 会吃光收益。建议单拍 payload 大于约 1～2MB 才开逐拍；否则退回「整次集体结束再切」或「只在 RS/AG 相变切一次」。
+5. **CCU_SCHED 更难。** CCU 把多拍收成循环小任务，拍边界不一定暴露给软件。逐拍切分首期只做 AI CPU；CCU 先做整次集体边界或相变处（若 Mission 模板按相切开）。
+
+落地顺序：先 **RS→AG 相变一次**（Ring 和 HD 都能做，仍在同一次 AllReduce 内）→ 大消息 Ring 再开逐拍 → HD 不默认逐拍。
 
 ---
 
