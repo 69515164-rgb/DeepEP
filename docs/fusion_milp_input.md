@@ -735,3 +735,75 @@ C11 → 槽1
 
 **950 上的融合 = CCU 调度 + UB Memory 槽 + 写完事件。**  
 不是 Cube 直连网口，也不是写 HBM 再 HCCL。950PR 尤其不能走中间 HBM，否则打在 1.6TB/s 墙上。
+
+---
+
+## 13. 求解器输出件：对齐 MSCCL/HCCL 的 XML→可执行件，但不要只出集体 XML
+
+集体综合器（MSCCL / MSCCLang / 昇腾 HCCLang）的终点是一张**只含通信步骤**的算法描述，再编成运行时能加载的东西（XML、再转 bin，或直接生成 HCCL 的 `.h/.cc` 编排）。融合求解器不能停在这一张上：HCCL 假定数据已经在输入 buffer 里；融合多出来的是「哪一块 C-tile 写完才允许发哪一包」，以及这包在 **UB Memory 槽** 而不在 HBM/CCL buffer。
+
+### 13.1 建议三层，不要一个文件包打天下
+
+```text
+求解器唯一合同     fused_mm_ar.json     （人能 diff、能版本化）
+        │
+        ├─ 下降 A  集体子图  →  现有 XML → bin / HCCLang → HCCL 能调
+        ├─ 下降 B  事件表    →  STARS Notify：槽写完才 post
+        └─ 下降 C  槽位表    →  UB Memory ping-pong 布局
+```
+
+`fused_mm_ar.json` 是求解器的**输出件**。XML/bin 是给 HCCL 通信引擎的**派生物**，不要让求解器直接只吐 XML。
+
+### 13.2 合同里必须有的字段（运行时要读）
+
+```text
+meta
+  op            = mm_allreduce
+  sketch        = Ring | HD          # 冻死的邻居关系
+  expansion     = CCU_SCHED
+  visibility    = UB_MEMORY
+  dtype, nranks
+
+tiling_echo                         # 回显编译器输入，求解器不改
+  BM, BN, BK, grid, issue_order
+  tiles_per_chunk
+
+workspace
+  kind          = ub_memory
+  nslots, slot_bytes
+  slot_of[tile]                     # C00→槽0, C01→槽1, ...
+
+produce                             # 融合相对纯集体多出来的核心
+  { tile, chunk, slot, event }      # tile 写完槽 → 允许发 chunk
+
+collective                          # 和 MSCCL 同构的那一段
+  chunk 字节、每 rank 每跳：
+    send/recv/reduce
+    对端 rank、VT/Jetty
+    依赖：等哪条 produce 事件、等哪条远端 CQE
+```
+
+### 13.3 合同里禁止出现的字段
+
+墙上时钟（`start_us`、`ready_us`、`sleep`）、新的 `BM/BN`、新的 tile 序。估时只允许写在可选的 `debug_plan.json`，运行时加载器不得读。
+
+### 13.4 下降到 HCCL 时 XML 里多什么、不多什么
+
+现有集体 XML 继续描述 send/recv/reduce。融合只多两类节点，不要把 MMA 写进 XML：
+
+```text
+<wait event="tile_C00_slot0"/>     # 本地 Cube 写完槽，不是定时器
+<send chunk="0" vt="0" src="slot0"/>
+```
+
+HCCL 侧把 `<wait event>` 落到 LocalNotify / STARS 依赖；`<send src=slot>` 落到 CCU WQE 的 UB Memory 地址。资源计算要多报：槽字节、槽数、每条 produce 边一个 Notify。这和 HCCL 自定义算法的「资源计算 + 编排」是对齐的，只是 Input 从 CCL buffer 换成槽。
+
+### 13.5 和 2×2 例子对应的最小输出
+
+```text
+produce:  C00→chunk0@槽0, C01→chunk1@槽1, C10→chunk2@槽0, C11→chunk3@槽1
+comm:     Ring 上 chunk0..3 的 send/recv/reduce（邻居来自 sketch）
+constraint: 覆写槽0 必须晚于 chunk0 的发送 CQE
+```
+
+没有 12 μs。HCCL 拿到的 bin 里是事件边和槽地址。
