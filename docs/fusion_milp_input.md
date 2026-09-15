@@ -20,7 +20,8 @@ Tiling 是另一类搜索：Cube/MMA 形状、L1/L0、K 向流水、ping-pong、
 所以「融合算子自动生成」在本方案里的含义是：
 
 ```text
-计算编译器给定：tiling + MM 计算流图 + tile→chunk 生产关系 + 计算占用
+计算编译器给定：tiling + 计算流图
+               （produce、ready、占用时间轴都从这两份推，不再单独要）
 MILP 只决定：  各 chunk 何时走哪条链路 / 哪个 VT，且不得早于 ready
 ```
 
@@ -31,29 +32,25 @@ MILP 只决定：  各 chunk 何时走哪条链路 / 哪个 VT，且不得早于
 ## 1. 推荐架构（简洁版）
 
 ```text
-┌─────────────────────────────┐
-│ 计算侧（给定，不进搜索）      │
-│  tiling 策略                 │
-│  MM 计算流图 / tile 序        │
-│  produce(tile → chunk)       │
-│  每 tile 完成时间或 T_mm      │
-│  计算已占用的 Cube / HBM / STARS │
-└──────────────┬──────────────┘
-               │ 推导 release[c,r]
+┌──────────────────────────────┐
+│ 计算编译器只给两份              │
+│  1. tiling 策略               │
+│  2. 计算流图（tile 依赖 + 耗时） │
+└──────────────┬───────────────┘
+               │ 机械推导
+               │   produce、ready、占用时间轴
                ▼
-┌─────────────────────────────┐
-│ MILP（只编通信）              │
-│  原集体约束 + 不早发          │
-│  剩余链路 / VT / SDMA 容量    │
-│  输出：通信 schedule          │
-└─────────────────────────────┘
+┌──────────────────────────────┐
+│ MILP 只编通信                  │
+│  原集体约束 + send ≥ ready     │
+└──────────────────────────────┘
 ```
 
-求解器**可以**决定的：在给定就绪之后，chunk 走哪条边、哪个 epoch、哪个 VT；通信与已占用计算时间轴如何错开。
+`produce` 和占用时间轴**不是**编译器再交的第三、第四份产物。上一版把它们写在输入清单里，容易理解成还要单独导出一张映射表和一条 occupancy trace。只要 tiling 和流图给全了，这两样是函数，不是决策。
 
-求解器**不得**决定的：`BM,BN,BK`、tile 网格、K 向流水、tile 计算顺序、epilogue 位置、Cube 指令级调度。
+求解器**可以**决定的：ready 之后 chunk 走哪条边、哪个 epoch、哪个 VT。
 
-连通信算法也可以冻：输入带 Ring/HD sketch 时，求解器只排每拍字节和与 MM 的重叠，不换邻居。这是最简可行域。
+求解器**不得**决定的：`BM,BN,BK`、tile 网格、K 向流水、tile 序、epilogue、Cube 指令级调度。
 
 ---
 
@@ -72,71 +69,123 @@ AllReduce 需求仍在：每 rank 每 chunk 一份 partial，最后每人都有�
 
 ---
 
-## 3. 计算侧必须给定的输入（不搜索）
+## 3. tiling 和计算流图各给什么（够不够推出 produce / 占用轴）
 
-### 3.1 tiling 策略
+**够。** 编译器只需这两份。`produce` 是 tiling 上的分块函数；占用时间轴是流图按时间展开后的资源占用。不要让编译器再导一张映射表、一条 occupancy trace——那是重复信息，还容易和 tiling 打架。
 
-由计算编译器一次选定，MILP 当常量。
+只多两个**标量约定**（不是图）：通信把几块 C tile 收成一个 chunk（`tiles_per_chunk`），以及 C 写到通信可见层要多久（`store_delay`）。前者是集体分块习惯，后者是存储层次常数。
+
+### 3.1 tiling 策略给什么
+
+描述**空间怎么切**，不描述谁先算。对象是张量上的网格，不是时间轴。
 
 ```text
 tiling:
-  BM, BN, BK
-  wave / pipeline 级数
-  输出 tile 网格（沿 M、N）
-  写出路径  寄存器 → L2 → HBM，store_delay
+  问题形状     M, N, K, dtype, layout
+  输出块       BM × BN          → C 被切成 ceil(M/BM) × ceil(N/BN) 个 C-tile
+  K 向块       BK               → 每个 C-tile 要 ceil(K/BK) 次 MMA 才写完
+  迭代空间     循环嵌套顺序      例如：N-tile 外、M-tile 中、K 内
+  流水         wave / pipeline 级数（同一拍几个 C-tile 在 Cube 上）
+  可见性       C-tile 完成 K 归约后，经过哪一级才对通信可见
+               store_delay = 寄存器→L2→HBM 的固定延迟
 ```
 
-通信 chunk 网格必须是这套 tiling 的**导出量**：每个 chunk = 若干完整输出 tile 的并。禁止 tile 跨两个 chunk。对不齐则拒实例，不要在 MILP 里加 reorder 变量。
+它回答的问题：
 
-### 3.2 计算流图
+| 问题 | tiling 给的答案 |
+| --- | --- |
+| 一块可发给 AllReduce 的数据最小是什么 | 一个写完的 C-tile（BM×BN） |
+| 有多少块、每块多大 | 网格 `Tm × Tn`，每块 `BM*BN*sizeof` |
+| 一块要算多久才「算完」 | 由 BK、K、流水级数决定（流图用这个当节点粒度） |
+| chunk 允许怎么切 | 只能沿 C-tile 网格做**整块合并**，不能横切一块 C-tile |
 
-一张有向图，节点是 MM tile（或 wave），边是依赖。
+**tiling 不够单独当通信输入**：它没有「第 3 个 C-tile 何时算完」，也没有「那时 Cube 占着没有」。时间在流图里。
+
+### 3.2 计算流图给什么
+
+描述**这些 tile 按什么依赖、花多长时间算**。节点必须就是 3.1 里的 C-tile（或 wave = 同一拍的几个 C-tile），不能另起一套名字。
 
 ```text
 compute_dag:
-  nodes    tile t @ rank r
-  edges    t1 → t2  的偏序（通常已是总序：kernel 的 issue 序）
-  T_mm[t]  或 每个节点的绝对 finish_time（相对 kernel 起点）
-  occupancy[t]  该节点占用的 Cube / HBM / STARS 配额
+  nodes   每个 C-tile（或 wave）@ rank
+  edges   依赖：同一 C-tile 的 K 片必须按序；
+          issue 序（kernel 已排好的总序，或 wave 级偏序）
+  dur[t]  该节点占用 Cube 的时长（由 BM,BN,BK 和硬件模型算出，
+          编译器给数即可，MILP 不当变量）
 ```
 
-流图是输入，不是决策变量。求解器不得重排 tile 去「让某条链路更早有货」——那是在改 GEMM。
+它必须已经是**排好序的执行计划**，不是「还有自由度的 DAG」。若只有偏序、没有 issue 序和 `dur`，就推不出占用时间轴，那份流图不合格。
 
-由流图机械推出通信就绪：
+排好之后，对每个节点：
 
 ```text
-produce[t, r] → c
-ready[c, r] = max{ finish(t) + store_delay | produce(t,r)=c }
-send(c, r, *) ≥ ready[c, r]
+start[t]  = max{ start[pred]+dur[pred] }   # 沿 issue 序
+finish[t] = start[t] + dur[t]
 ```
 
-`produce` 必须满射到所有 chunk。这张表跟 tiling 一起由计算侧给出。
+这就是计算时间轴。通信只读 `finish`。
 
-### 3.3 算子语义（校验用，不搜）
+**流图不够单独当通信输入**：节点是 C-tile，AllReduce 的 chunk 可能是 4 个 C-tile 拼的。谁拼给谁，要靠 tiling 网格 + `tiles_per_chunk`，不是靠依赖边。
+
+### 3.3 从这两份推 produce 和占用轴
+
+**produce**（C-tile → 通信 chunk）：
 
 ```text
-gemm:     M,N,K / dtype / layout
+约定：沿被约简张量的切分轴，每连续 tiles_per_chunk 个 C-tile 合成一个 chunk
+      （行并行 AllReduce 通常沿 N 或沿 rank 内的输出行）
+
+produce[t] = floor( tile_index(t) / tiles_per_chunk )
+ready[c]   = max{ finish[t] + store_delay | produce[t]=c }
+```
+
+`tiles_per_chunk=1` 时 chunk ≡ C-tile，produce 是恒等。这是最简对齐。只要 tiling 的 C 网格和集体 chunk 数能整除，produce 就是这个函数，不必编译器再吐一张表。
+
+**占用时间轴**（何时占了哪些计算资源）：
+
+```text
+每个节点带资源向量 u[t] = (Cube, HBM_rw, STARS_compute, ...)
+         —— 同类 tile 相同，是硬件表，不是每实例一张图
+
+occupancy(τ) = sum{ u[t] | start[t] ≤ τ < finish[t] }
+comm_residual(τ) = 硬件上限 − occupancy(τ)
+```
+
+流图有 `start/finish` 和每类节点的 `u`，占用轴就是扫描线。不必编译器再导 occupancy.trace。
+
+```text
+tiling  ─────────┐
+  空间网格        ├── produce、chunk 字节、tiles_per_chunk 合法性
+计算流图 ────────┤
+  finish[t]       ├── ready[c]
+  start/finish+u  └── occupancy(τ) / 通信剩余容量
+```
+
+还缺的只是两个标量：`tiles_per_chunk`、`store_delay`。再加一张很小的**资源常量表** `u`（Cube 一拍占几条、HBM 一 tile 读多少），对所有 MM+AR 实例共用。
+
+### 3.4 算子语义（校验，不搜）
+
+```text
 parallel: row_tp → AllReduce(Y)；列并行是 AllGather，勿混
-reduce:   张量、轴、op
 epilogue: 钉死在 AR 前或后
 ```
 
-用来检查 `pattern` 与集体是否匹配、chunk 字节是否等于生产 tile 之和，不进入搜索。
+形状已在 tiling 里。这里只查模式和集体是否匹配。
 
 ---
 
 ## 4. 求解器还要的通信侧增量
 
-计算占用已经从流图来了，通信侧只需**剩余容量**：
+占用轴推出之后，通信侧用的是**剩余容量**（推导结果，仍不必手填一条 trace）：
 
 ```text
-comm_slots     同时可跑的 VT / CCU Mission（≤ 硬件上限 − 计算已占）
-hbm_rest       计算占用之后剩给 SDMA/UB 的 HBM
-exclusive[]    与计算互斥的资源（950PR 禁止 HBM 中继）
-workspace      未发出 chunk 的缓冲档数（双缓冲是 tiling 给定的，这里只读档数）
+comm_slots(τ)  硬件 VT/CCU 上限 − occupancy(τ).stars
+hbm_rest(τ)    HBM 上限 − occupancy(τ).hbm
+exclusive[]    SKU 常量（950PR 禁止 HBM 中继）
+workspace      来自 tiling 的 C 双缓冲档数
 ```
 
-不要让求解器再估「算满速时链路也满速」。占用时间轴是输入。
+不要让求解器假设「算满速时链路也满速」。剩余容量随 `τ` 变，来自流图，不是再搜。
 
 ---
 
@@ -166,32 +215,34 @@ T_end >= 每个 rank 上 AR 结果可用时间  # 决策变量
 instance = {
   /* 旧集体 */
   topology, alpha_beta, collective=AllReduce, epoch,
-  sketch = Ring | HD | ...,          # 默认冻算法边
+  sketch = Ring | HD | ...,
 
-  /* 计算侧给定，不搜索 */
-  tiling{BM,BN,BK,wave,store_delay},
-  compute_dag{nodes, edges, finish_time | T_mm, occupancy},
-  produce[tile,rank] -> chunk,
-  chunk{C,B},                        # 由 tiling 导出
-  gemm{M,N,K,dtype}, parallel{row_tp,P,rank_map},
-  epilogue_after_ar,
+  /* 编译器只给这两份 */
+  tiling{BM,BN,BK,wave,loop_order,store_delay},
+  compute_dag{nodes=C-tiles, issue_order, dur[t]},
 
-  /* 通信剩余资源 */
-  comm_slots, hbm_rest, exclusive_resources[], workspace,
+  /* 标量约定 + 硬件表，不是图 */
+  tiles_per_chunk,                   # 默认 1：chunk ≡ C-tile
+  u = (Cube, HBM, STARS_compute),    # 每类 tile 的资源向量，实例间共用
+  exclusive[],                       # SKU 常量
 
-  objective = fused_makespan,        # 实质是 min 通信完成，下界钉在 dag.sink
+  /* 下面全部推导，禁止手填另一份 */
+  # produce, chunk{C,B}, ready, occupancy, comm_slots(τ), hbm_rest(τ)
+
+  parallel{row_tp,P,rank_map}, epilogue_after_ar,
+  objective = fused_makespan,
   deterministic = bool
 }
 ```
 
 求解前拒掉：
 
-- tiling 与 chunk 不对齐（tile 跨 chunk，或字节对不上）。
-- `produce` 未覆盖全部 chunk。
+- 流图节点不是 tiling 的 C-tile / wave（两套网格对不上）。
+- 流图没有 issue 序或没有 `dur`（推不出时间轴）。
+- `tiles_per_chunk` 不能整除 C-tile 数。
 - `pattern` 与集体不匹配。
-- `finish_time` / `T_mm` 与 `alpha/beta` 时间单位不一致。
-- `comm_slots` 超过剩余硬件配额。
-- 缺计算流图或缺 tiling：直接拒，不要回退去搜 BM/BN。
+- `dur` 与 `alpha/beta` 时间单位不一致。
+- 缺 tiling 或缺流图：直接拒，不要回退去搜 BM/BN。
 
 ---
 
@@ -199,7 +250,7 @@ instance = {
 
 | 原约束 | 默认融合扩展 |
 | --- | --- |
-| chunk 在 t=0 可发 | 换成输入表 `ready[c,r]` |
+| chunk 在 t=0 可发 | 换成推导出的 `ready[c]` |
 | 链路容量 / epoch | 仍在；epoch 轴要覆盖 dag 时间，计算占用当已用容量 |
 | 流守恒 / reduce | 仍在；reduce 不得早于 partial 到达且不得早于本地 ready |
 | 对称 | 计算序已对称则可继续切轨道 |
@@ -223,7 +274,7 @@ instance = {
 
 ---
 
-## 9. 950 上计算侧还要写进 occupancy 的量
+## 9. 950 上写进资源表 `u` / `exclusive` 的量
 
 | 输入 | 写在哪 |
 | --- | --- |
