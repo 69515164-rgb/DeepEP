@@ -807,3 +807,57 @@ constraint: 覆写槽0 必须晚于 chunk0 的发送 CQE
 ```
 
 没有 12 μs。HCCL 拿到的 bin 里是事件边和槽地址。
+
+---
+
+## 14. 替换路径：框架 API 不变，换的是算子内部的 plan
+
+CANN 已经有融合算子接口（如 `aclnnGroupedMatMulAllReduce` / `aclnnMatmulAllReduce`）。框架（PyTorch / MindSpore）只调这一层：先 GetWorkspaceSize，再 Execute。**自动生成不新增、不改这些参数。** 生成件不是给框架调用的新 API，而是这个算子在 GetWorkspaceSize 里查到的一份 **plan**，用来换掉出厂 kernel 的内部编排。
+
+和 `HCCL_ALGO`、MSCCL 的 `XML_FILES` 同一类机制：调用点不变，实现被选中。
+
+```text
+框架
+  npu_grouped_matmul_all_reduce(x, w, ..., group)     # 一行不改
+        │
+        ▼
+aclnnGroupedMatMulAllReduceGetWorkspaceSize(...)      # 签名不变
+        │  按 (shape, dtype, world, SKU, group) 查表
+        ├─ 命中生成件 → executor 挂上这份 plan
+        └─ 未命中     → 出厂 MC2 kernel（现网兜底）
+        ▼
+aclnnGroupedMatMulAllReduce(workspace, executor, stream)
+```
+
+### 14.1 输出件交给谁、放哪
+
+离线求解按「问题签名」各出一份，安装进算子能搜到的目录，不进训练脚本。
+
+```text
+$MC2_FUSED_PLAN_DIR/          # 或打进自定义 opp
+  manifest.json               # 签名 → 文件名
+  gmm_ar_<signature>.bin      # 运行时真正加载的
+  gmm_ar_<signature>.json     # 可选，人读/对账，运行时可不读
+```
+
+`manifest.json` 用输入就能算出来的键索引，例如：
+
+```text
+op, sku, nranks, dtype, M, N, K, group_pattern, reduce=sum
+```
+
+GMM 的 `groupList` 是动态的：签名里写分组模式（组数、各组 M 是否同构），不要把某一次运行的绝对指针写进 plan。
+
+### 14.2 GetWorkspaceSize 里做什么（API 内部，调用者看不见）
+
+1. 用本次 `x/weight/groupList/group/dtype` 算签名。  
+2. 在 `MC2_FUSED_PLAN_DIR` 查 manifest。  
+3. 命中：`workspaceSize` 按 plan 里的槽数/字节返回（可以和出厂值不同，这仍是原接口的出参）；executor 保存 plan 句柄。  
+4. 未命中或校验失败（邻居数对不上、可见层不是 UB Memory）：走出现厂实现，行为与今天完全一致。  
+5. Execute 只按 executor 里已绑定的 plan 下 Cube Mission 和 CCU WQE。
+
+`commTurn` 等现有参数**保留在 API 上**，保证 ABI。命中生成件时以内编排为准，该参数不再自己切通信份数。
+
+### 14.3 谁在何时生成
+
+作业前或编译自定义 opp 时，对要保的形状各跑一次求解器，把 bin 装进目录。训练进程启动后只读盘、不求解。形状变了找不到签名，自动回退出厂，而不是改框架代码。
