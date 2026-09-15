@@ -9,6 +9,7 @@
 集体综合器原来的输入是：**拓扑 + 链路代价 + 静态需求**。输出应理解成「谁把哪块 chunk 发给谁、由什么事件触发」，不是墙上时钟的闹钟。融合后多出来的是**计算→通信的先后依赖**；离线求解若要比较「几种打包/几条 VT 谁更快」，才用流图估一个 `ready`，运行时不按这个数启动。
 
 运行时正确性与估时的分工见第 11 节（抖动、访存争抢下不需要、也不该给出通信启动时刻）。
+950 上「Y 不落 HBM、片上直接发」见第 12 节。
 
 ---
 
@@ -579,3 +580,158 @@ C01 实际 14 μs 才写完（规划以为 10）
 
 **依赖保证对；估时只用来选方案；时钟不进内核。**  
 问「要不要给出通信启动时间」：运行时不要。离线可以估一个，用完就扔。
+
+---
+
+## 12. 昇腾 950：计算输出不落 HBM，直接发起通信
+
+**结论：中间结果不要走 HBM，但也不能从 Cube 累加器直接发。**  
+握手层是 **UB 域的片上缓冲（UB Memory）**：Cube 把一块写完的 C-tile 放进 ping-pong 槽，STARS 事件一到，CCU 用该槽当地址发 UB WQE。IO Die 端口转发不进计算 Die，也就不占 HBM。
+
+这和第 11 节一致：运行时仍是「写完才发」，只是「写完」的可见层从 HBM 改成 UB Memory。
+
+### 12.1 950 上各层谁看得见通信
+
+先把两个都叫 UB 的东西分开（背景）：
+
+```text
+核上 UB     AscendC Unified Buffer，Cube/Vector 核内暂存
+互连 UB     Unified Bus，超节点内芯片互连
+UB Memory   互连 UB 引擎可当 WQE 源/目的的片上缓冲（通信可见）
+```
+
+| 层 | 算得完 C-tile？ | URMA / UB 引擎能当 src？ | 落不落 HBM | 融合里扮演什么 |
+| --- | --- | --- | --- | --- |
+| L0C | 累加器，K 没折完不能发 | 否 | 否 | 只算，不发 |
+| L1 / 核上 UB | 可暂存一块 | 通常否（不是 rank 间地址） | 否 | 核内搬运 |
+| **UB Memory** | 放得下一块 C-tile | **是，CCU 的 WQE src/dst** | **否** | **计算-通信握手层** |
+| HBM | 放得下整表 Y | 是，但是 AICPU_TS 默认路径 | 是 | 融合失败才回退；最终 Y 可在此落地 |
+| UB Port / IO Die | — | 转发 | 不进计算 Die | 超节点内直传 |
+| UBoE | — | 超节点间 | 不默认等同片上直传 | 不要假设还能不落 HBM |
+
+```text
+X、W 仍从 HBM 读进来    ← 矩阵乘输入太大，片上放不下
+Y_partial  不写 HBM     ← 本节省掉的就是这一笔
+AllReduce 在 UB Memory 上收、加、再发
+规约完的 Y  需要时再写回 HBM 给下一层    ← 这是融合算子结束之后，不是中间
+```
+
+950PR 片上/HBM 档 1.6TB/s。中间再写一笔 Y，计算和通信会在这堵墙上对打；PReCCL 方案里 PR 的 L2 也**禁止 HBM 中继**。所以 950PR 上融合的主路径必须是 UB 域，不是「Cube 写 HBM + HCCL 再读 HBM」。
+
+### 12.2 推荐路径：`CCU_SCHED` + STARS 同拍
+
+不要用默认 `AICPU_TS` 做这条融合。官方语义里 AI CPU 模式是 **HBM↔HBM**；CCU 调度才是「不用 CcuBuffer，rank 间片上内存直传」。
+
+```text
+STARS 同时挂两条 Mission（通信占用建议 ≤16，给 Cube 留配额）
+
+  Cube Mission
+    MMA 折完一块 C-tile
+    DataMove / Vector：L0C → UB Memory 槽 s     # 片上搬，不经 HBM
+    发 Notify / 完成事件
+
+  CCU Mission   （等上面这条事件，不是等 12 μs）
+    UB WQE { src = 槽 s, dst = 对端 UB Memory 槽 }
+    Jetty k → Transport Channel k → UB Port
+    IO Die 可互转，不进计算 Die
+
+  对端
+    收到后在 UB Memory 上 Vector 做 reduce
+    下一跳仍以 UB Memory 为 src
+```
+
+事件链（和第 11 节同一句话，只换可见层）：
+
+```text
+wait( UB Memory 槽 s 写完成 );  post_ub_wqe(src=s, vt=k)
+槽 s 在对应 CQE 回来之前禁止 Cube 覆写     # workspace = ping-pong 槽数
+```
+
+`store_delay` 在这条路径上不是「寄存器→HBM」的微秒数，而是片上 fence / Notify，规划里可当 0。
+
+### 12.3 ping-pong：片上放不下整张 Y
+
+UB Memory 远小于 `M×N`。所以「不落 HBM」**逼出**第 10 节那种按 C-tile 流式发，而不是等全部算完。
+
+```text
+槽数建议 2～4（send 用 2 槽 ping-pong，Ring 再加 1 个 recv 槽）
+
+例：C-tile 128×128 FP16 = 32KB
+    4 槽 ≈ 128KB，远小于 950PR 的 HBM，也小于 CCU 文档里 512KB～2MB 的通信 Tile
+
+因此融合主路径默认 tiles_per_chunk = 1
+想打成 512KB 一包，必须先在 UB Memory 里攒够，或承认会溢到 HBM
+```
+
+和 PReCCL 推荐 Tile 的冲突要显式处理：
+
+| | 通信切分（PReCCL） | 片上融合 |
+| --- | --- | --- |
+| 粒度 | 512KB～2MB，摊 alpha | 一块 C-tile（几十 KB） |
+| 源地址 | 往往假定大 buffer | 必须是当前活着的槽 |
+| 首期 | 融合路径**不做动态切分**（见 950 设计 2.1） | 槽位已很紧，再迁尾部会打乱覆写规则 |
+
+首期：冻 Ring、一块一包、写完就发、不做 VT 动态迁徙。等融合跑稳再谈切分。
+
+### 12.4 AllReduce 中间也不要回 HBM
+
+Ring / HD 每一跳都是「收一块 + 本地加 + 再发」。若 reduce 写回 HBM 再读出发，中间融合就废了。
+
+```text
+recv 槽  ⊂ UB Memory
+acc      ⊂ UB Memory（Vector add，或小块回 Cube 再写回槽）
+send 槽  ⊂ UB Memory
+禁止：recv → HBM → send
+```
+
+对端关系仍冻在 sketch 里。求解器不改邻居，只决定这块挂哪条 Jetty——但 src 始终是槽地址，不是 HBM VA。
+
+### 12.5 哪些情况做不到「全程不落 HBM」
+
+| 情况 | 怎么办 |
+| --- | --- |
+| 输入 X、W | 本来就在 HBM，允许。省的是 Y_partial |
+| 融合结束、下一层要 GM | 规约完的 Y **一次**写回 HBM。这是算子出口，不是中间 |
+| 超节点间 UBoE | CCU 调度对象是 UB WQE。跨超节点不要假设仍能片上直传；机内 UB 融合 + 机间允许落 HBM/走 AI CPU |
+| 单机大 AR 触发官方回退 | 回退 `AICPU_TS` = HBM↔HBM，本 CCT 放弃片上路径 |
+| CCU 配额被算满（32 Mission） | 同样回退。融合优先占 Mission，通信 VT 建议 ≤8 |
+| AscendC+CCU 自定义核常见上限 | ≤8 卡 FullMesh、单次 ≤256MB。128 卡 950PR 用 **Ring/NHR 而不是 FullMesh** |
+| 950PR L2 拥塞 | 只允许 IO Die 换端口，禁止 SDMA 经 HBM 中继（与本路径一致） |
+
+验收：中间路径的 SDMA/HBM 计数应为 0（X/W 读和最终 Y 写除外）。这和 `docs/ascend950_preccl_design.md` 里「950PR 上 L2 不得出现额外 HBM 中继」同一根尺子。
+
+### 12.6 对融合合同改什么（相对落 HBM 版）
+
+```text
+visibility     = UB_MEMORY          # 不再是 HBM
+produce 边     = C-tile 写入槽 s 完成
+workspace      = ping-pong 槽数（2～4），不是 HBM 双缓冲
+store_delay    ≈ 0（片上 Notify）
+u.HBM_Y        = 0                  # Y_partial 不占 HBM
+u.HBM_XW       = 读 X/W 的带宽      # 仍在
+u.STARS        = Cube Mission + CCU Mission 同拍
+exclusive[]    += 950PR：Y_partial 禁止 HBM；禁止融合 CCT 内 HBM 中继
+expansion      = CCU_SCHED          # 禁止把 AICPU_TS 当融合主路径
+tiles_per_chunk= 1                  # 被槽容量逼出来的默认
+动态 VT 切分   = 首期关
+```
+
+运行时仍然**没有通信启动时刻**。Cube 写完槽 s 的事件就是 post 的唯一扳机。
+
+### 12.7 和 2×2 手算怎么对齐
+
+第 10 节四个 C-tile，落在 2 个发送槽上：
+
+```text
+C00 → 槽0 写完 → send0（VT k）     同时 C01 往槽1 写
+C01 → 槽1 写完 → send1             槽0 要等 send0 的 CQE 才能给 C10 覆写
+C10 → 槽0
+C11 → 槽1
+```
+
+规划里的 12 μs 仍然只是估时。运行时是槽写完就发；HBM 上没有这四块 Y_partial。
+
+### 12.8 领导一句话
+
+**950 上的融合 = CCU 调度 + UB Memory 槽 + 写完事件。**  
+不是 Cube 直连网口，也不是写 HBM 再 HCCL。950PR 尤其不能走中间 HBM，否则打在 1.6TB/s 墙上。

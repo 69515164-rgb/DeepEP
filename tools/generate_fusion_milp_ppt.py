@@ -241,6 +241,53 @@ def build():
     note(s, "一句话：依赖保证对；估时只用来选方案；时钟不进内核。访存争抢的残差交给硬件仲裁；若还要运行时再切分，走自适应 VT，而不是改启动时刻。",
          0.6, 4.35, 12.15, 2.05)
 
+    s = base_slide(prs, "950 上不能从累加器直接发，握手层是 UB Memory", "950  /  不落 HBM")
+    add_text(s, "两个 UB：核上 UB = Cube 暂存；互连 UB = 超节点总线。通信能当源地址的是 UB Memory。",
+             0.7, 1.2, 12, 0.32, 14, LIGHT)
+    for i, (t, b, c) in enumerate([
+        ("L0C / L1", "只负责算完一块\n网口看不见\nK 没折完更不能发", MID),
+        ("UB Memory 槽", "Cube 把 C-tile 写进这里\nCCU 的 WQE 源地址\n不进 HBM、不进计算 Die", GREEN),
+        ("HBM", "X/W 仍从这里读\n最终 Y 可写回给下一层\n中间再走就是 950PR 的墙", RED),
+    ]):
+        card(s, t, b, 0.6 + i * 4.15, 1.65, 3.95, 2.55, c, 16, 14)
+    note(s, "背景：950PR HBM 档 1.6TB/s，PReCCL 方案里 L2 也禁止 HBM 中继。融合若 Cube 写 HBM、HCCL 再读，计算和通信在同一堵墙上对打，片上直传的意义就没了。",
+         0.6, 4.4, 12.15, 2.0)
+
+    s = base_slide(prs, "落地：CCU 调度 + 槽写完事件 + UB WQE", "950  /  数据面")
+    steps = [
+        ("Cube", "折完 C-tile\n片上搬进槽 s", BLUE),
+        ("Notify", "槽 s 写完成\n不是墙上时钟", ORANGE),
+        ("CCU", "UB WQE\nsrc=槽 s", GREEN),
+        ("IO Die", "Port 直传\n不进计算 Die", CYAN),
+    ]
+    for i, (t, b, c) in enumerate(steps):
+        x = 0.55 + i * 3.2
+        rect(s, x, 1.28, 2.95, 2.15, DARK, True, c)
+        pill(s, t, x + 0.85, 1.42, 1.2, c, 13)
+        add_text(s, b, x + 0.15, 1.9, 2.65, 1.25, 14, LIGHT, False, PP_ALIGN.CENTER)
+        if i < 3:
+            add_text(s, "→", x + 2.85, 2.05, 0.4, 0.45, 22, MID, True)
+    bullets(s, [
+        "展开模式必须是 CCU_SCHED；默认 AICPU_TS 是 HBM↔HBM，当不了这条主路径",
+        "Ring 的收、加、再发也都在 UB Memory 上，禁止 recv→HBM→send",
+        "槽在对应 CQE 回来之前不能覆写：片上 workspace = 2～4 个 ping-pong 槽",
+    ], 0.7, 3.6, 12, 1.55, 15)
+    note(s, "X、W 仍从 HBM 读（片上放不下）。省掉的是 Y_partial 这一笔。规约完的 Y 在算子出口可以一次写回 HBM 给下一层——那不是中间路径。",
+         0.6, 5.25, 12.15, 1.2)
+
+    s = base_slide(prs, "950PR 上尤其要守的边界", "950  /  约束")
+    rows = [
+        ("通信粒度跟 C-tile", "槽只有几十～几百 KB，默认一块一包；不要为摊 alpha 攒到 2MB 再溢回 HBM"),
+        ("首期不做动态 VT 切分", "槽位覆写规则已经很紧；切分见 950 PReCCL 方案，融合跑稳再说"),
+        ("128 卡用 Ring 不是 FullMesh", "自定义 CCU 核常见上限约 8 卡 FullMesh；超节点内走 Ring/NHR"),
+        ("跨超节点不假设片上直传", "UBoE 仍可走 AI CPU；机内 UB 融合 + 机间允许落 HBM"),
+        ("回退即放弃片上路径", "大 AR 或 CCU 配额满 → AICPU_TS，本 CCT 按 HBM↔HBM，权重冻结"),
+    ]
+    for i, (t, b) in enumerate(rows):
+        y = 1.22 + i * 0.85
+        pill(s, t, 0.6, y, 3.7, RED if i == 0 else ORANGE, 12)
+        add_text(s, b, 4.5, y, 8.2, 0.55, 14, LIGHT)
+
     s = base_slide(prs, "背景：现有求解器本来只干一件事——编通信", "名词  /  MILP 综合器")
     add_text(s, "输入：卡怎么连、每条链路多慢、要做哪种集合、数据切成几块。\n输出：一张时刻表——谁在何时把哪一块发给谁。",
              0.7, 1.22, 12, 0.7, 16, LIGHT)
@@ -358,8 +405,8 @@ def build():
     add_text(s, "立项口径：运行时只加「写完才发」的依赖；估时仅离线选打包/VT。切块仍由计算编译器给定，启动时刻不进内核。",
              0.7, 1.25, 12, 0.7, 17, WHITE, True)
     for i, (n, t, b, c) in enumerate([
-        ("01", "冻结接口", "tiling + produce 边\n必给；dur 仅离线可选", BLUE),
-        ("02", "最小内核改动", "挂写完事件再 post\n禁止定时器启动", CYAN),
+        ("01", "冻结接口", "tiling + produce 边\n950：可见层=UB Memory", BLUE),
+        ("02", "最小内核改动", "槽写完再 post UB WQE\n走 CCU_SCHED，禁闹钟", CYAN),
         ("03", "先冻通信算法", "Ring/HD、写完就发\n无选择时不做 MILP", GREEN),
         ("04", "用总时间验收", "对比两阶段基线\n数值必须一致", ORANGE),
     ]):
@@ -383,11 +430,13 @@ def build():
         ("produce 边", "这些 C-tile 写完才允许发对应一包（运行时硬约束）"),
         ("ready 估时", "离线用的数字；运行时不读。不准是必然，只影响是否选到最优结构"),
         ("Ring / HD", "AllReduce 的两种经典传法；本方案建议给定、不搜"),
+        ("UB Memory", "950 上通信可见的片上槽；Y_partial 写这里，不写 HBM"),
+        ("CCU_SCHED", "片上直传展开模式；默认 AICPU_TS 是 HBM↔HBM，不当主路径"),
     ]
     for i, (t, b) in enumerate(rows):
-        y = 1.16 + i * 0.54
-        add_text(s, t, 0.7, y, 3.3, 0.46, 12, CYAN, True)
-        add_text(s, b, 4.1, y, 8.5, 0.46, 13, LIGHT)
+        y = 1.12 + i * 0.48
+        add_text(s, t, 0.7, y, 3.3, 0.42, 12, CYAN, True)
+        add_text(s, b, 4.1, y, 8.5, 0.42, 13, LIGHT)
 
     prs.core_properties.title = "融合算子自动生成 MM+AllReduce"
     prs.core_properties.subject = "领导汇报：计算编译器给定切块与流图，MILP 只编通信"

@@ -253,6 +253,8 @@ URMA
 
 950PR 片上带宽 1.6TB/s。L2 **只允许 IO Die 转发**。
 
+MM+AllReduce 若要做到「Y 不落 HBM」：走本节 CCU_SCHED，Cube 把 C-tile 写入 UB Memory ping-pong 槽，STARS 事件到后再发 UB WQE。不要用 `AICPU_TS` 的 HBM↔HBM 当融合主路径。数据面细节见 `docs/fusion_milp_input.md` 第 12 节。首期融合不做动态 VT 切分。
+
 ---
 
 ## 3. AI CPU 模式（`AI_CPU` / `AICPU_TS`）
