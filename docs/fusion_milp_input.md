@@ -861,3 +861,13 @@ GMM 的 `groupList` 是动态的：签名里写分组模式（组数、各组 M 
 ### 14.3 谁在何时生成
 
 作业前或编译自定义 opp 时，对要保的形状各跑一次求解器，把 bin 装进目录。训练进程启动后只读盘、不求解。形状变了找不到签名，自动回退出厂，而不是改框架代码。
+
+### 14.4 和出厂实现不是同一种 bin
+
+出厂 GMM+AllReduce **不是**「一个形状一份算法 bin」。它是普通 AscendC 算子：
+
+- 芯片上的 **kernel `.o`**：按 SoC / tilingKey 编好的一段通用程序，里面是 MatMul + `HcclServer`，从 tiling 结构读切块和通信份数。  
+- Host 上的 **tiling 库**：`GetWorkspaceSize` 现场根据本次 shape 算出那块结构。  
+- **aclnn 动态库**：框架调的入口。
+
+通信步骤写在 C++/AscendC 里，不写成 MSCCL 那种 XML。自动生成要加的 `gmm_ar_<签名>.bin` 才是按问题签名实例化的 plan，用来**替换 Host 算出来的那份编排**（以及 kernel 怎么发），不是 CANN 今天已经在用的交付形态。
