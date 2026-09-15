@@ -524,7 +524,15 @@ flowchart TD
   end
 ```
 
-**图 C：时序（组件 × 层次）**
+**图 C：时序——只调数据切分、不动算法**
+
+调整发生在**两个集体之间的 L0 Host Allocator**，改的是下一张 `tile→VT` 表（慢 VT 的尾部连续 Tile 划给快 VT）。算法图（Ring/NHR/邻居/树角色/边）全程不改。CCT 内 L2 只按表挂区间，L3～L5 不改已发 WQE。
+
+```text
+唯一调整点：CCT e 的 Wait 返回之后、CCT e+1 的 Prepare 之前
+           L0 Allocator 写 tile→VT_{e+1}
+生效点：    下一集体 L2 展开时，同一张算法图换各 VT 的连续字节区间
+```
 
 ```mermaid
 sequenceDiagram
@@ -537,26 +545,58 @@ sequenceDiagram
   participant Net as L5 UB / UBoE
   participant Peer as L6 对端同 VT
 
-  Host->>CPU: 写 tile→VT，关 cache
-  AIC->>CPU: Commit 本集体
-  CPU->>CPU: 展开算法，上下文 k 只绑 Jetty k
+  Note over Host,Peer: 算法图全程冻结：HCCL_ALGO / 邻居 / 树角色 / 边 不改
 
-  loop 每个 VT 的连续 Tile
-    CPU->>STARS: 下发该 Tile 的 TS 任务
-    STARS->>URMA: doorbell SQE
-    URMA->>Net: Transport Channel k 发出
-    Net->>Peer: UB Port 或 400G
-    Peer-->>URMA: 数据 + Notify
-    URMA-->>CPU: CQE
-    CPU->>CPU: stall / bytes_done 累加
+  rect rgb(236, 242, 248)
+    Note over Host,CPU: CCT e：只用已冻结的 tile→VT_e，不改切分
+    Host->>CPU: 下发 tile→VT_e（各 VT 的连续字节区间）
+    AIC->>CPU: Commit
+    CPU->>CPU: 按原算法展开；把区间挂到既有 VT=Jetty k
+    loop 每个 VT 的连续 Tile
+      CPU->>STARS: 下发该 Tile 的 TS 任务
+      STARS->>URMA: doorbell SQE
+      URMA->>Net: Transport Channel k 发出
+      Net->>Peer: UB Port 或 400G
+      Peer-->>URMA: 数据 + Notify
+      URMA-->>CPU: CQE
+      CPU->>CPU: 只累加 stall / bytes_done，不改表
+    end
+    Note over CPU,STARS: stream_stall 只辅信号，不进切分
+    CPU->>AIC: Wait 返回，CCT e 结束
   end
 
-  Note over CPU,STARS: stream_stall 只在等 notify/SDMA 时加<br/>不进权重
-  CPU->>AIC: 集体完成，Wait 返回
-  CPU->>Host: 捎带 stall 向量
-  Host->>Host: 小 AllReduce + Allocator
-  Host->>CPU: 下一 epoch 的 tile→VT
+  rect rgb(255, 243, 205)
+    Note over Host: 唯一调整位置：L0 Allocator<br/>只改下一张 tile→VT，不动算法
+    CPU->>Host: 捎带 stall 向量
+    Host->>Host: 小 AllReduce 规约（各 rank 对齐）
+    Host->>Host: Allocator：慢 VT 尾部连续 Tile 划给快 VT<br/>w_e → w_e+1，算法图不碰
+    Host->>CPU: 写入 tile→VT_e+1（关 cache）
+  end
+
+  rect rgb(236, 248, 236)
+    Note over Host,CPU: CCT e+1：同一张算法图，新的 Tile 区间
+    AIC->>CPU: Commit
+    CPU->>CPU: 仍按原算法展开；只换各 VT 挂的连续 Tile
+    loop 每个 VT 的新连续 Tile
+      CPU->>STARS: 下发该 Tile 的 TS 任务
+      STARS->>URMA: 仍是同一个 Jetty k
+      URMA->>Net: 仍是同一条 Transport Channel
+      Net->>Peer: 对端角色不变，只是 payload 长短变
+      Peer-->>CPU: CQE
+    end
+    CPU->>AIC: Wait 返回
+  end
 ```
+
+对着时序图读「改什么 / 不改什么」：
+
+| 时刻 | 层 | 改 | 不改 |
+| --- | --- | --- | --- |
+| CCT e 内 | L2～L6 | 无（只记账 stall） | 算法、tile→VT_e、已发 WQE、Jetty |
+| **Wait 之后、下一 Prepare 之前** | **L0 Allocator** | **只改 tile→VT_{e+1}（尾部连续区间）** | **HCCL_ALGO、邻居、树角色、VT↔Jetty 绑定** |
+| CCT e+1 Prepare | L2 | 按新表把 Tile 挂到原 VT | 算法展开模板、Jetty、Port |
+
+---
 
 层次约束（对着图读）：
 
