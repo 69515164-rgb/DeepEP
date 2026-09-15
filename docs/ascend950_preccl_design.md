@@ -380,6 +380,195 @@ URMA
 | Decode + UBEP/DeepEP P2P | 关闭 |
 | 跨超节点 EP | 不要用本方案硬切；EP 留在单 UB 域 |
 
+### 3.5 分层与动作流程
+
+AI CPU 模式七层。上面三层是控制/编排，下面四层是数据面。切分只发生在 L0→L2 的集体边界；L3～L5 的已发 WQE 不改绑。
+
+```text
+L0  Host 控制面      Allocator / tile→VT / cache 开关 / stall 规约
+L1  HCCL API / AIC   Prepare · Commit · Wait
+L2  AI CPU 编排面    展开算法 / 并发上下文 k / poll stall / 捎带
+L3  STARS 调度面     TS 排队 / SDMA / URMA·UBoE 任务
+L4  URMA 传输面      Jetty k SQ/CQ / Transport Channel k
+L5  网络面           UB Port · IO Die 转发  或  UBoE 400G
+L6  对端对称栈       收包 → Notify/CQE → 原语义 reduce/copy
+```
+
+**图 A：组件层次（谁在哪一层）**
+
+```mermaid
+flowchart TB
+  subgraph L0["L0 Host 控制面"]
+    H1["Allocator 确定性算 w"]
+    H2["tile→VT 表 Device 可见"]
+    H3["AICPU_CacheDisable / 失效 cache"]
+    H4["小 AllReduce 规约 stall 向量"]
+  end
+
+  subgraph L1["L1 HCCL API / AIC"]
+    P1["Prepare 挂 tiling"]
+    P2["Commit 通知 AI CPU 服务端"]
+    P3["Wait 等本集体结束"]
+  end
+
+  subgraph L2["L2 AI CPU 编排面  HCCL 服务端"]
+    C1["读 tile→VT 展开算法"]
+    C2["并发上下文 VT0..VTk"]
+    C3["poll: sq_stall / cq_stall / stream_stall"]
+    C4["捎带 epoch,mode,vt,stall,bytes_done"]
+  end
+
+  subgraph L3["L3 STARS 调度面"]
+    S1["TS 任务队列"]
+    S2["SDMA 拷/规约"]
+    S3["URMA / UBoE doorbell"]
+  end
+
+  subgraph L4["L4 URMA 传输面"]
+    U1["Jetty k  FIFO"]
+    U2["Transport Channel k"]
+  end
+
+  subgraph L5["L5 网络面"]
+    N1["UB Port / IO Die 九口互转"]
+    N2["UBoE 2x400G"]
+  end
+
+  subgraph L6["L6 对端对称栈"]
+    D1["对端 Jetty k 收齐"]
+    D2["Notify / CQE"]
+    D3["HCCL 原语义 reduce/copy"]
+  end
+
+  H1 --> H2 --> P1
+  H3 --> C1
+  P1 --> P2 --> C1 --> C2
+  C2 --> S1
+  S1 --> S2
+  S1 --> S3 --> U1 --> U2
+  U2 --> N1
+  U2 --> N2
+  N1 --> D1
+  N2 --> D1
+  D1 --> D2 --> C3
+  S2 --> C3
+  C3 --> C4 --> H4 --> H1
+  D2 --> D3
+  P3 -.-> C3
+```
+
+**图 B：一个 epoch 的动作怎么穿过各层**
+
+实线是热路径（本 CCT 内）。虚线是集体边界才走的控制路径。编号是时间序。
+
+```mermaid
+flowchart TD
+  start["epoch e 开始"] --> a1
+
+  subgraph phase1["集体前  控制面"]
+    a1["1 L0 Host 写入 tile→VT 表"]
+    a2["2 L0 关 AI CPU cache"]
+    a3["3 L1 AIC Prepare 挂表 / Commit"]
+    a1 --> a2 --> a3
+  end
+
+  a3 --> a4
+
+  subgraph phase2["集体内  编排面展开"]
+    a4["4 L2 AI CPU 读表 按算法展开"]
+    a5["5 L2 为每个 VT 挂连续 Tile<br/>禁止一条上下文喷多 Jetty"]
+    a4 --> a5
+  end
+
+  a5 --> a6
+
+  subgraph phase3["集体内  数据面下发与传输"]
+    a6["6 L3 STARS 下发该 VT 的 SDMA/URMA 任务"]
+    a7["7 L4 Jetty k doorbell  已发 WQE 不改绑"]
+    a8["8 L5 出 UB Port 或 UBoE"]
+    a9["9 L6 对端同 VT 收齐 Notify/CQE"]
+    a6 --> a7 --> a8 --> a9
+  end
+
+  a9 --> a10
+
+  subgraph phase4["集体内  检测"]
+    a10["10 L2 poll 该上下文"]
+    a11{"FIFO 有没有往前走"}
+    a12["sq_stall++  本端 SQ/credit"]
+    a13["cq_stall++  路径或对端"]
+    a14["stream_stall++  只辅信号<br/>notify/SDMA 依赖"]
+    a15["bytes_done += CQE 长度"]
+    a10 --> a11
+    a11 -->|"SQ 满 / doorbell 失败"| a12
+    a11 -->|"已提交在等 CQE"| a13
+    a11 -->|"在等 notify 或 SDMA"| a14
+    a11 -->|"CQE 到"| a15
+  end
+
+  a12 --> a16
+  a13 --> a16
+  a14 --> a16
+  a15 --> a16{"本 VT Tile 是否发完"}
+  a16 -->|否| a6
+  a16 -->|是| a17["11 L1 Wait 返回  本 CCT 结束"]
+
+  a17 --> a18
+
+  subgraph phase5["集体后  切分只在这里"]
+    a18["12 L2 捎带 stall 向量"]
+    a19["13 L0 小 AllReduce 规约"]
+    a20["14 L0 Allocator 算 T_hat<br/>L1 组内迁尾部 Tile / L2 降整组份额"]
+    a21["15 下一 CCT Prepare 加载 w_e+1"]
+    a18 --> a19 --> a20 --> a21
+  end
+```
+
+**图 C：时序（组件 × 层次）**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Host as L0 Host<br/>Allocator
+  participant AIC as L1 AIC / HCCL API
+  participant CPU as L2 AI CPU<br/>HCCL 服务端
+  participant STARS as L3 STARS
+  participant URMA as L4 Jetty k
+  participant Net as L5 UB / UBoE
+  participant Peer as L6 对端同 VT
+
+  Host->>CPU: 写 tile→VT，关 cache
+  AIC->>CPU: Commit 本集体
+  CPU->>CPU: 展开算法，上下文 k 只绑 Jetty k
+
+  loop 每个 VT 的连续 Tile
+    CPU->>STARS: 下发该 Tile 的 TS 任务
+    STARS->>URMA: doorbell SQE
+    URMA->>Net: Transport Channel k 发出
+    Net->>Peer: UB Port 或 400G
+    Peer-->>URMA: 数据 + Notify
+    URMA-->>CPU: CQE
+    CPU->>CPU: stall / bytes_done 累加
+  end
+
+  Note over CPU,STARS: stream_stall 只在等 notify/SDMA 时加<br/>不进权重
+  CPU->>AIC: 集体完成，Wait 返回
+  CPU->>Host: 捎带 stall 向量
+  Host->>Host: 小 AllReduce + Allocator
+  Host->>CPU: 下一 epoch 的 tile→VT
+```
+
+层次约束（对着图读）：
+
+| 动作 | 层 | 何时 | 不做什么 |
+| --- | --- | --- | --- |
+| 写/换 tile→VT | L0 | 集体边界 | 不在 CCT 中途改表 |
+| 展开、挂 Tile、poll stall | L2 | CCT 内 | 不从 AIC 自定义核改 Jetty |
+| 下 TS 任务 | L3 | CCT 内 | 不一条任务喷多 Jetty |
+| doorbell / 传包 | L4 L5 | CCT 内 | 不改已发 WQE、不 Jetty 内喷包 |
+| 收齐、原语义 reduce | L6 | CCT 内 | 不换算法图 |
+| 算 T_hat、L1/L2 切分 | L0 | 集体后 | `stream_stall` 单独涨则冻权重 |
+
 ---
 
 ## 4. 模式回退与一层集体两套 VT
