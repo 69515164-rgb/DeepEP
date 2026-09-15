@@ -671,19 +671,75 @@ step i 全部 CQE 收齐之后       检测 + 算 tile→VT_{i+1}
 step i+1 开始下 WQE 之前       生效（本拍对端的收发双方对齐长度表）
 ```
 
-**图 D：一次 AllReduce 内，算法拍 i → 拍 i+1（补齐 L0～L6）**
+**图 D：一次 AllReduce 内，算法拍 i → 拍 i+1（L0～L6）**
 
 ```text
-L0  Host           本集体不再下发表；Allocator 下沉到 L2 拍间
-L1  AIC / HCCL API  开头 Commit 一次，结尾 Wait 一次
-L2  AI CPU          按拍循环、poll stall、拍间改 tile→VT
-L3  STARS           每拍每 VT 下 TS 任务
-L4  URMA Jetty k    doorbell / CQE，已发 WQE 不改绑
-L5  UB / UBoE       Transport Channel k 出端口
-L6  本拍对端        同 VT 收齐；尾包对齐下一拍长度表
+L0  Host 控制面      本集体不再写表；Allocator 下沉到 L2 拍间
+L1  HCCL API / AIC   开头 Commit 一次，结尾 Wait 一次
+L2  AI CPU 编排面    按拍循环 / poll stall / 拍间改 tile→VT
+L3  STARS 调度面     每拍每 VT 下 TS 任务
+L4  URMA 传输面      Jetty k doorbell / CQE，已发 WQE 不改绑
+L5  网络面           Transport Channel k → UB Port 或 UBoE
+L6  本拍对端         同 VT 收齐；尾包对齐下一拍长度表
 ```
 
 切分只发生在黄块的 **L2**。蓝/绿块里 L3～L6 只传数。L0 不在拍间热路径。
+
+**图 D1：三拍 × 七层**
+
+左到右是时间（拍 i → 拍间 → 拍 i+1），上到下是层次（L0→L6）。黄列只有 L2 改表。
+
+```mermaid
+flowchart LR
+  subgraph start["入口"]
+    direction TB
+    e0["L0 不写表"]
+    e1["L1 Commit 一次"]
+  end
+
+  subgraph hopi["拍 i  蓝"]
+    direction TB
+    i2["L2 按 tile→VT_i 挂 chunk"]
+    i3["L3 每 VT 一条 TS"]
+    i4["L4 Jetty k doorbell"]
+    i5["L5 Channel k 出端口"]
+    i6["L6 对端收齐 Notify"]
+    i2b["L2 poll stall / bytes_done"]
+    i2 --> i3 --> i4 --> i5 --> i6 --> i2b
+  end
+
+  subgraph mid["拍间  黄  唯一改表"]
+    direction TB
+    m0["L0 不参与"]
+    m1["L1 不参与"]
+    m2["L2 Allocator 写 tile→VT_i+1"]
+    m3["L3～L6 只捎带 w_i+1"]
+    m0 --- m1 --- m2 --> m3
+  end
+
+  subgraph hopj["拍 i+1  绿"]
+    direction TB
+    j2["L2 按新表挂下一拍 Tile"]
+    j3["L3 仍下原 VT 的 TS"]
+    j4["L4 仍是 Jetty k"]
+    j5["L5 仍是 Channel k"]
+    j6["L6 角色不变 字节多少变"]
+    j2 --> j3 --> j4 --> j5 --> j6
+  end
+
+  subgraph fin["出口"]
+    direction TB
+    f1["L1 Wait 一次"]
+    f0["L0 仍不改表"]
+  end
+
+  e1 --> i2
+  i2b --> m2
+  m2 --> j2
+  j6 --> f1
+```
+
+**图 D2：时序（组件 × 层次）**
 
 ```mermaid
 sequenceDiagram
@@ -699,51 +755,53 @@ sequenceDiagram
 
   App->>AIC: 一次 HcclAllReduce（Ring / HD）
   AIC->>CPU: Commit（整次集体只这一次）
-  Note over Host,Peer: 算法图冻结：谁在哪一拍跟谁说话不改<br/>L0 本集体不再写表
+  Note over Host,Peer: 算法图冻结：谁在哪一拍跟谁说话不改
+  Note over Host: L0 本集体不再写表
 
   rect rgb(236, 242, 248)
     Note over CPU,Peer: 算法拍 i：L2→L6 只用 tile→VT_i
-    CPU->>CPU: 按原算法挂本拍 chunk 到各 VT
-    CPU->>STARS: 每 VT 一条 TS 任务
-    STARS->>URMA: doorbell SQE
-    URMA->>Net: Transport Channel k 发出
-    Net->>Peer: 本拍数据（UB Port 或 UBoE）
-    Peer-->>URMA: Notify
-    URMA-->>STARS: CQE
-    STARS-->>CPU: 本拍该 VT 完成
-    CPU->>CPU: L2 poll：sq_stall / cq_stall / bytes_done<br/>已发 WQE 不改
+    CPU->>CPU: L2 按原算法挂本拍 chunk 到各 VT
+    CPU->>STARS: L2→L3 每 VT 一条 TS 任务
+    STARS->>URMA: L3→L4 doorbell SQE
+    URMA->>Net: L4→L5 Transport Channel k
+    Net->>Peer: L5→L6 本拍数据
+    Peer-->>URMA: L6→L4 Notify
+    URMA-->>STARS: L4→L3 CQE
+    STARS-->>CPU: L3→L2 本拍该 VT 完成
+    CPU->>CPU: L2 poll stall / bytes_done，已发 WQE 不改
   end
 
   rect rgb(255, 243, 205)
-    Note over CPU,Peer: 拍间屏障：切分只在 L2，仍在同一次 AllReduce 内
-    CPU->>STARS: 尾包捎带 w_i+1
-    STARS->>URMA: 带内 footer（不新建连接）
-    URMA->>Net: 原 Channel 带出
-    Net->>Peer: 下一拍长度表
-    Peer-->>CPU: 对端对齐（或双方同一公式本地算）
-    CPU->>CPU: L2 Allocator：慢 VT 尾部 Tile 划给快 VT<br/>写 tile→VT_i+1；不碰算法、不回 L0
+    Note over CPU,Peer: 拍间屏障：切分只在 L2，同一次 AllReduce 内
+    CPU->>STARS: L2→L3 尾包捎带 w_i+1
+    STARS->>URMA: L3→L4 带内 footer
+    URMA->>Net: L4→L5 原 Channel
+    Net->>Peer: L5→L6 下一拍长度表
+    Peer-->>CPU: L6→L2 对端对齐（或双方同一公式）
+    CPU->>CPU: L2 Allocator 写 tile→VT_i+1<br/>不碰算法、不回 L0
   end
 
   rect rgb(236, 248, 236)
-    Note over CPU,Peer: 算法拍 i+1：仍走 L3～L6，同一 Jetty，新区间
-    CPU->>STARS: 按 tile→VT_i+1 下下一拍 Tile
-    STARS->>URMA: 仍是 Jetty k，不改绑
-    URMA->>Net: 仍是 Transport Channel k
-    Net->>Peer: 对端角色不变，只是各口字节多少变
-    Peer-->>URMA: Notify
-    URMA-->>CPU: 拍 i+1 CQE
+    Note over CPU,Peer: 算法拍 i+1：再走 L2→L6，同一 Jetty，新区间
+    CPU->>STARS: L2→L3 按 tile→VT_i+1 下 Tile
+    STARS->>URMA: L3→L4 仍是 Jetty k
+    URMA->>Net: L4→L5 仍是 Channel k
+    Net->>Peer: L5→L6 角色不变，各口字节多少变
+    Peer-->>URMA: L6→L4 Notify
+    URMA-->>CPU: L4→L2 拍 i+1 CQE
   end
 
-  CPU->>AIC: 全部拍结束
-  AIC-->>App: Wait 返回
+  CPU->>AIC: L2→L1 全部拍结束
+  AIC-->>App: L1 Wait 返回
+  Note over Host: L0 仍不改表
 ```
 
 对着层次读：
 
-| 块 | 走到的层 | 改什么 |
+| 块 | 穿过的层 | 改什么 |
 | --- | --- | --- |
-| 蓝 拍 i | L2 下发 → L3 → L4 → L5 → L6 回 CQE | 只记账 stall |
-| 黄 拍间 | **只 L2** 算表；L3～L6 只捎带 `w_{i+1}` | 只改下一拍 `tile→VT` |
+| 蓝 拍 i | L2 → L3 → L4 → L5 → L6，CQE 原路回 L2 | 只记账 stall |
+| 黄 拍间 | **改表只在 L2**；L3～L6 只捎带 `w_{i+1}`；L0/L1 不参与 | 只改下一拍 `tile→VT` |
 | 绿 拍 i+1 | 再走一遍 L2→L6 | 按新区间下 WQE，Jetty/算法不变 |
 
 **Ring 和 HD 能不能逐拍切，不一样。**
