@@ -1,6 +1,9 @@
 # 把集合通信 MILP 用于融合算子（MM+AllReduce）时的输入要求
 
-**默认分工：求解器不做 tiling，也不生成计算流图。** tiling 策略和 MM 的计算流图由计算编译器 / 算子实现给定；MILP 只在「货何时就绪」的约束下做通信编排。这比联合搜索算-传更干净，也才是 TACCL / TE-CCL / SyCCL 这类求解器能扩的范围。
+**默认分工：求解器不做 tiling，也不生成计算流图。** tiling 策略和 MM 的计算流图由计算编译器 / 算子实现给定；MILP 只在「货何时就绪」的约束下做通信编排。
+
+领导汇报稿：`docs/融合算子自动生成_MM_AllReduce.pptx`（背景名词已在页内标注）。
+详细合同：本文。
 
 集体综合器原来的输入是：**拓扑 + 链路代价 + 静态需求**。输出是「谁在何时把哪块 chunk 发给谁」。融合后静态需求变成**带就绪时间的时变需求**；就绪时间从给定的计算流图推出来，不是求解器搜出来的。
 
@@ -278,10 +281,10 @@ instance = {
 
 | 输入 | 写在哪 |
 | --- | --- |
-| 展开模式 AICPU_TS / CCU_SCHED | 通信拍边界；ready 信号在哪一层 |
-| Cube 与 CCU 同拍与否 | occupancy 里计算与通信是否互斥 |
-| HBM 档 PR 1.6 / DT 4 | `hbm_rest` |
+| 展开模式 AICPU_TS / CCU_SCHED | 通信拍边界；ready 对应流图哪一层 finish |
+| Cube 与 CCU 同拍与否 | `u` 里 STARS 是否与通信互斥 |
+| HBM 档 PR 1.6 / DT 4 | 硬件上限，占用轴展开后得 `hbm_rest(τ)` |
 | 禁止 HBM 中继（PR） | `exclusive` |
-| 计算已占的 STARS / CCU / SDMA | `comm_slots` 的上限 |
+| 每类 C-tile 占的 Cube / HBM / STARS | 资源表 `u`，不是 occupancy trace |
 
-这些由 kernel 实现和 SKU 决定，随计算流图一起给，不搜。
+这些是 SKU / kernel 常数，随 tiling 走，不搜、不另给时间轴。
