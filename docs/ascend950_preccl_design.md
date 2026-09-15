@@ -671,43 +671,80 @@ step i 全部 CQE 收齐之后       检测 + 算 tile→VT_{i+1}
 step i+1 开始下 WQE 之前       生效（本拍对端的收发双方对齐长度表）
 ```
 
-**图 D：一次 AllReduce 内，算法拍 i → 拍 i+1**
+**图 D：一次 AllReduce 内，算法拍 i → 拍 i+1（补齐 L0～L6）**
+
+```text
+L0  Host           本集体不再下发表；Allocator 下沉到 L2 拍间
+L1  AIC / HCCL API  开头 Commit 一次，结尾 Wait 一次
+L2  AI CPU          按拍循环、poll stall、拍间改 tile→VT
+L3  STARS           每拍每 VT 下 TS 任务
+L4  URMA Jetty k    doorbell / CQE，已发 WQE 不改绑
+L5  UB / UBoE       Transport Channel k 出端口
+L6  本拍对端        同 VT 收齐；尾包对齐下一拍长度表
+```
+
+切分只发生在黄块的 **L2**。蓝/绿块里 L3～L6 只传数。L0 不在拍间热路径。
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant App as 训练框架
+  participant Host as L0 Host
+  participant AIC as L1 AIC / HCCL API
   participant CPU as L2 AI CPU<br/>HCCL 服务端
-  participant VT as VT/Jetty 0..K
-  participant Peer as 本拍对端
+  participant STARS as L3 STARS
+  participant URMA as L4 Jetty k
+  participant Net as L5 UB / UBoE
+  participant Peer as L6 本拍对端
 
-  App->>CPU: 一次 HcclAllReduce（Ring 或 HD）
-  Note over CPU: 算法图冻结：谁在哪一拍跟谁说话 不改
+  App->>AIC: 一次 HcclAllReduce（Ring / HD）
+  AIC->>CPU: Commit（整次集体只这一次）
+  Note over Host,Peer: 算法图冻结：谁在哪一拍跟谁说话不改<br/>L0 本集体不再写表
 
   rect rgb(236, 242, 248)
-    Note over CPU,Peer: 算法拍 i：只用 tile→VT_i
-    CPU->>VT: 本拍 chunk 按 VT_i 切成连续区间
-    VT->>Peer: 下 WQE 并传完
-    Peer-->>CPU: 本拍全部 CQE
-    CPU->>CPU: 记 sq_stall / cq_stall / bytes_done
+    Note over CPU,Peer: 算法拍 i：L2→L6 只用 tile→VT_i
+    CPU->>CPU: 按原算法挂本拍 chunk 到各 VT
+    CPU->>STARS: 每 VT 一条 TS 任务
+    STARS->>URMA: doorbell SQE
+    URMA->>Net: Transport Channel k 发出
+    Net->>Peer: 本拍数据（UB Port 或 UBoE）
+    Peer-->>URMA: Notify
+    URMA-->>STARS: CQE
+    STARS-->>CPU: 本拍该 VT 完成
+    CPU->>CPU: L2 poll：sq_stall / cq_stall / bytes_done<br/>已发 WQE 不改
   end
 
   rect rgb(255, 243, 205)
-    Note over CPU,Peer: 拍间屏障：本拍 WQE 已全部完成<br/>仍在同一次 AllReduce 调用内
-    CPU->>Peer: 尾包捎带下一拍权重 w_i+1
-    Peer-->>CPU: 对端确认（或对称各算各的，公式相同）
-    CPU->>CPU: Allocator 只改下一拍各 VT 的连续 Tile<br/>慢 VT 尾部划给快 VT
+    Note over CPU,Peer: 拍间屏障：切分只在 L2，仍在同一次 AllReduce 内
+    CPU->>STARS: 尾包捎带 w_i+1
+    STARS->>URMA: 带内 footer（不新建连接）
+    URMA->>Net: 原 Channel 带出
+    Net->>Peer: 下一拍长度表
+    Peer-->>CPU: 对端对齐（或双方同一公式本地算）
+    CPU->>CPU: L2 Allocator：慢 VT 尾部 Tile 划给快 VT<br/>写 tile→VT_i+1；不碰算法、不回 L0
   end
 
   rect rgb(236, 248, 236)
-    Note over CPU,Peer: 算法拍 i+1：同一套邻居/对端序列，新切分
-    CPU->>VT: 下一拍 chunk 按 tile→VT_i+1 下 WQE
-    VT->>Peer: 仍是原 Jetty，只是各口字节多少变了
-    Peer-->>CPU: 拍 i+1 CQE
+    Note over CPU,Peer: 算法拍 i+1：仍走 L3～L6，同一 Jetty，新区间
+    CPU->>STARS: 按 tile→VT_i+1 下下一拍 Tile
+    STARS->>URMA: 仍是 Jetty k，不改绑
+    URMA->>Net: 仍是 Transport Channel k
+    Net->>Peer: 对端角色不变，只是各口字节多少变
+    Peer-->>URMA: Notify
+    URMA-->>CPU: 拍 i+1 CQE
   end
 
-  CPU-->>App: 整次 AllReduce Wait 返回
+  CPU->>AIC: 全部拍结束
+  AIC-->>App: Wait 返回
 ```
+
+对着层次读：
+
+| 块 | 走到的层 | 改什么 |
+| --- | --- | --- |
+| 蓝 拍 i | L2 下发 → L3 → L4 → L5 → L6 回 CQE | 只记账 stall |
+| 黄 拍间 | **只 L2** 算表；L3～L6 只捎带 `w_{i+1}` | 只改下一拍 `tile→VT` |
+| 绿 拍 i+1 | 再走一遍 L2→L6 | 按新区间下 WQE，Jetty/算法不变 |
 
 **Ring 和 HD 能不能逐拍切，不一样。**
 
