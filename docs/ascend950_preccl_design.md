@@ -131,7 +131,7 @@ epoch e:
   4. 下一次 Prepare 加载新表
 ```
 
-Agreement 用 HCCL 已有小 AllReduce。训练 K=1；推理 decode 可加大 K 或关闭。任一 rank 的 `mode` 与多数不一致：本 epoch **冻权重**，下一集体按实际模式重建 VT 表。
+Agreement 优先用集体同步捎带，不够再走小 AllReduce。训练按 step 收口（step i 改表，step i+1 的 Prepare 生效，见 3.5）；推理 decode 可多步一调或关闭。任一 rank 的 `mode` 与多数不一致：本 epoch **冻权重**，下一集体按实际模式重建 VT 表。
 
 ---
 
@@ -534,13 +534,47 @@ flowchart TD
 生效点：    下一集体 L2 展开时，同一张算法图换各 VT 的连续字节区间
 ```
 
-是的：一次集体一旦 `Commit`，本 CCT 的切分就冻死；新表最早在**下一次该通信域重新 Prepare/Commit** 时生效。三点不要收窄：
+是的：一次集体一旦 `Commit`，本 CCT 的切分就冻死。生产默认按 **训练 step** 收口，不要求框架再单独 Host 下发一张表。
 
-1. 触发结束的是**任意**走这张 VT 表的集体（AllReduce / AllGather / RS / A2A 都行），不是只有业务 AllReduce。图 C 黄块里的小 AllReduce 只是 stall 向量规约，不是「必须再跑完一次梯度 AllReduce 才能改表」。
-2. 「下一次 Host 下发」= 下一次该 `HcclComm` 的 Prepare/Commit。同一步里 AllReduce 之后还有 AllGather，AllGather 就可以用新表（K=1）。不是必须等到下一个训练 step。
-3. 单算子路径：Host 写下表 → 下次 Commit 必读新表。图模式 / AI CPU cache：只 Host 下发不够，必须失效通信子图或 `AICPU_CacheDisable`，否则重放的是旧展开。
+**推荐：step i 的本地 HCCL 调用内做完检测和改表，step i+1 的本地 HCCL 调用 Prepare 读新表生效。**
 
-CCT 中途、已下 WQE、同一次 `Wait` 返回前，都不能改。K>1 时连续 K 次集体共用一张表，第 K 次 `Wait` 之后才改。
+```text
+同一次 HcclAllReduce 调用内、Commit 之后     不可能改本 CCT（已发 WQE / 算法边都不动）
+step i 这次调用的 Wait 之后、返回用户之前    检测收口 + Allocator 写 tile→VT_{i+1}
+step i+1 这次调用的 Prepare                 本地读表，按新区间展开 —— 生效点
+```
+
+不需要框架在两个 step 之间再调一次「下发表」的 Host API。表放在 Device 可见内存，Allocator 是确定性纯函数：stall 已随 step i 的集体同步捎带对齐，各 rank 在本地就能算出同一张 `tile→VT_{i+1}`。图 C 黄块里的小 AllReduce 只在捎带还不够全局可见时才要；能捎带就省略。
+
+同一步里有多次集体（前向 AllGather、后向 AllReduce）：整步共用 `tile→VT_i`。指定一个 **epoch 集体**（通常是该通信域本 step 最后一次 AllReduce）在 `Wait` 后写下一张表；本 step 余下的集体仍用旧表。不要在 step i 的第一次集体后就改，以免同一步前后两次集体切分不一致。
+
+图模式要把 `tile→VT` 做成 **间接表**（Device 上的指针/数组，每次 Prepare 都读）。step i 写表后，step i+1 图重放不用重捕获也能读到新区间。做不到间接读就 `AICPU_CacheDisable` 或失效通信子图，否则「本地调用」仍吃旧展开。
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant App as 训练框架
+  participant HCCL as 本地 HCCL 调用
+  participant CPU as L2 AI CPU
+  participant Tbl as Device 上 tile→VT 表
+
+  App->>HCCL: step i  HcclAllReduce
+  HCCL->>CPU: Prepare 读 tile→VT_i（本 step 冻表）
+  CPU->>CPU: 原算法展开 + 传数 + 记 stall
+  CPU->>HCCL: Wait 返回
+  Note over HCCL,Tbl: 仍在这次本地调用内、返回用户之前
+  HCCL->>HCCL: 捎带 stall 已对齐则本地 Allocator
+  HCCL->>Tbl: 写 tile→VT_i+1
+  HCCL-->>App: 返回  step i 结束
+
+  App->>HCCL: step i+1  HcclAllReduce
+  Note over HCCL,CPU: 生效点：这次调用的 Prepare
+  HCCL->>Tbl: 本地读 tile→VT_i+1
+  HCCL->>CPU: 同一张算法图，换各 VT 连续 Tile
+  CPU->>HCCL: Wait
+  HCCL->>Tbl: 写 tile→VT_i+2
+  HCCL-->>App: 返回
+```
 
 ```mermaid
 sequenceDiagram
