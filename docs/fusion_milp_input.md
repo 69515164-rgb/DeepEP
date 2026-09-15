@@ -814,19 +814,26 @@ constraint: 覆写槽0 必须晚于 chunk0 的发送 CQE
 
 CANN 已经有融合算子接口（如 `aclnnGroupedMatMulAllReduce` / `aclnnMatmulAllReduce`）。框架（PyTorch / MindSpore）只调这一层：先 GetWorkspaceSize，再 Execute。**自动生成不新增、不改这些参数。** 生成件不是给框架调用的新 API，而是这个算子在 GetWorkspaceSize 里查到的一份 **plan**，用来换掉出厂 kernel 的内部编排。
 
-和 `HCCL_ALGO`、MSCCL 的 `XML_FILES` 同一类机制：调用点不变，实现被选中。
+和 `HCCL_ALGO`、MSCCL 的 `XML_FILES` 同一类机制：调用点不变，实现被选中。流程图源文件：`docs/figures/fused_plan_load.mmd`。
 
 ```text
-框架
-  npu_grouped_matmul_all_reduce(x, w, ..., group)     # 一行不改
+离线一次
+  求解器 → json 合同 → gmm_ar_<签名>.bin + manifest.json
+                         └── 放入 MC2_FUSED_PLAN_DIR（训练脚本不调用）
+
+每次前向（API 一行不改）
+  框架 npu_grouped_matmul_all_reduce
         │
         ▼
-aclnnGroupedMatMulAllReduceGetWorkspaceSize(...)      # 签名不变
-        │  按 (shape, dtype, world, SKU, group) 查表
-        ├─ 命中生成件 → executor 挂上这份 plan
-        └─ 未命中     → 出厂 MC2 kernel（现网兜底）
+  aclnn GetWorkspaceSize
+        │  用 x / w / groupList / dtype / 卡数算签名
+        │  查 manifest
+        ├─ 命中 → 加载对应 .bin，绑到 executor，workspace 按 bin
+        └─ 未命中 → 出厂：Host 算 tiling，加载芯片 kernel.o
         ▼
-aclnnGroupedMatMulAllReduce(workspace, executor, stream)
+  aclnn Execute(workspace, executor, stream)
+        ├─ 已绑 bin：按事件边和槽下 Cube / CCU
+        └─ 出厂：kernel.o 读 tiling，MatMul + HcclServer
 ```
 
 ### 14.1 输出件交给谁、放哪

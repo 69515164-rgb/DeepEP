@@ -401,6 +401,26 @@ def build():
         pill(s, t, 0.65, y, 3.35, RED if i < 2 else ORANGE, 13)
         add_text(s, b, 4.2, y, 8.4, 0.4, 16, LIGHT)
 
+    s = base_slide(prs, "调用 bin：框架仍走原 API，GetWorkspaceSize 里查表", "落地  /  加载")
+    add_text(s, "离线一次：求解器 → json → gmm_ar_<签名>.bin + manifest   放入计划目录，训练脚本不调用",
+             0.7, 1.18, 12, 0.32, 13, LIGHT)
+    steps = [
+        ("1 框架", "npu_gmm_all_reduce\n参数一行不改", BLUE),
+        ("2 GetWS", "用 shape/dtype/卡数\n算出签名查表", CYAN),
+        ("3a 命中", "加载对应 .bin\n绑到 executor", GREEN),
+        ("3b 未命中", "Host 算 tiling\n加载芯片 kernel.o", ORANGE),
+        ("4 Execute", "按已绑定的实现下发\nbin 或出厂 kernel", MID),
+    ]
+    for i, (t, b, c) in enumerate(steps):
+        x = 0.45 + i * 2.55
+        rect(s, x, 1.6, 2.4, 2.35, DARK, True, c)
+        pill(s, t, x + 0.12, 1.75, 2.16, c, 13)
+        add_text(s, b, x + 0.1, 2.22, 2.2, 1.5, 13, LIGHT, False, PP_ALIGN.CENTER)
+        if i < 4:
+            add_text(s, "→", x + 2.28, 2.45, 0.32, 0.4, 16, MID, True, PP_ALIGN.CENTER)
+    note(s, "3a 和 3b 只走一条。命中生成件时 Execute 按槽写完事件发 CCU；未命中则 MatMul+HcclServer，和今天完全一样。图源 docs/figures/fused_plan_load.mmd",
+         0.6, 4.2, 12.15, 2.15)
+
     s = base_slide(prs, "建议与下一步", "决策")
     add_text(s, "立项口径：运行时只加「写完才发」的依赖；估时仅离线选打包/VT。切块仍由计算编译器给定，启动时刻不进内核。",
              0.7, 1.25, 12, 0.7, 17, WHITE, True)
