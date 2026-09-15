@@ -534,6 +534,14 @@ flowchart TD
 生效点：    下一集体 L2 展开时，同一张算法图换各 VT 的连续字节区间
 ```
 
+是的：一次集体一旦 `Commit`，本 CCT 的切分就冻死；新表最早在**下一次该通信域重新 Prepare/Commit** 时生效。三点不要收窄：
+
+1. 触发结束的是**任意**走这张 VT 表的集体（AllReduce / AllGather / RS / A2A 都行），不是只有业务 AllReduce。图 C 黄块里的小 AllReduce 只是 stall 向量规约，不是「必须再跑完一次梯度 AllReduce 才能改表」。
+2. 「下一次 Host 下发」= 下一次该 `HcclComm` 的 Prepare/Commit。同一步里 AllReduce 之后还有 AllGather，AllGather 就可以用新表（K=1）。不是必须等到下一个训练 step。
+3. 单算子路径：Host 写下表 → 下次 Commit 必读新表。图模式 / AI CPU cache：只 Host 下发不够，必须失效通信子图或 `AICPU_CacheDisable`，否则重放的是旧展开。
+
+CCT 中途、已下 WQE、同一次 `Wait` 返回前，都不能改。K>1 时连续 K 次集体共用一张表，第 K 次 `Wait` 之后才改。
+
 ```mermaid
 sequenceDiagram
   autonumber
