@@ -1,0 +1,43 @@
+%% 图 C：跨集体时序——只调数据切分、不动算法（对照用）
+sequenceDiagram
+  autonumber
+  participant Host as L0 Host<br/>Allocator
+  participant AIC as L1 AIC / HCCL API
+  participant CPU as L2 AI CPU<br/>HCCL 服务端
+  participant STARS as L3 STARS
+  participant URMA as L4 Jetty k
+  participant Net as L5 UB / UBoE
+  participant Peer as L6 对端同 VT
+
+  Note over Host,Peer: 算法图全程冻结：HCCL_ALGO / 邻居 / 树角色 / 边 不改
+
+  rect rgb(236, 242, 248)
+    Note over Host,CPU: CCT e：只用已冻结的 tile→VT_e，不改切分
+    Host->>CPU: 下发 tile→VT_e
+    AIC->>CPU: Commit
+    CPU->>CPU: 按原算法展开；区间挂到 VT=Jetty k
+    loop 每个 VT 的连续 Tile
+      CPU->>STARS: 下发该 Tile 的 TS 任务
+      STARS->>URMA: doorbell SQE
+      URMA->>Net: Transport Channel k 发出
+      Net->>Peer: UB Port 或 400G
+      Peer-->>URMA: 数据 + Notify
+      URMA-->>CPU: CQE
+      CPU->>CPU: 只累加 stall / bytes_done
+    end
+    CPU->>AIC: Wait 返回，CCT e 结束
+  end
+
+  rect rgb(255, 243, 205)
+    Note over Host: 跨集体调整点：L0 Allocator 只改下一张 tile→VT
+    CPU->>Host: 捎带 stall 向量
+    Host->>Host: 小 AllReduce + Allocator
+    Host->>CPU: 写入 tile→VT_e+1
+  end
+
+  rect rgb(236, 248, 236)
+    Note over Host,CPU: CCT e+1：同一张算法图，新的 Tile 区间
+    AIC->>CPU: Commit
+    CPU->>CPU: 仍按原算法展开；只换各 VT 挂的连续 Tile
+    CPU->>AIC: Wait 返回
+  end

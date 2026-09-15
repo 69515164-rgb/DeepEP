@@ -1,0 +1,59 @@
+%% 图 A：AI CPU 模式组件层次
+flowchart TB
+  subgraph L0["L0 Host 控制面"]
+    H1["Allocator 确定性算 w"]
+    H2["tile→VT 表 Device 可见"]
+    H3["AICPU_CacheDisable / 失效 cache"]
+    H4["小 AllReduce 规约 stall 向量"]
+  end
+
+  subgraph L1["L1 HCCL API / AIC"]
+    P1["Prepare 挂 tiling"]
+    P2["Commit 通知 AI CPU 服务端"]
+    P3["Wait 等本集体结束"]
+  end
+
+  subgraph L2["L2 AI CPU 编排面  HCCL 服务端"]
+    C1["读 tile→VT 展开算法"]
+    C2["并发上下文 VT0..VTk"]
+    C3["poll: sq_stall / cq_stall / stream_stall"]
+    C4["捎带 epoch,mode,vt,stall,bytes_done"]
+  end
+
+  subgraph L3["L3 STARS 调度面"]
+    S1["TS 任务队列"]
+    S2["SDMA 拷/规约"]
+    S3["URMA / UBoE doorbell"]
+  end
+
+  subgraph L4["L4 URMA 传输面"]
+    U1["Jetty k  FIFO"]
+    U2["Transport Channel k"]
+  end
+
+  subgraph L5["L5 网络面"]
+    N1["UB Port / IO Die 九口互转"]
+    N2["UBoE 2x400G"]
+  end
+
+  subgraph L6["L6 对端对称栈"]
+    D1["对端 Jetty k 收齐"]
+    D2["Notify / CQE"]
+    D3["HCCL 原语义 reduce/copy"]
+  end
+
+  H1 --> H2 --> P1
+  H3 --> C1
+  P1 --> P2 --> C1 --> C2
+  C2 --> S1
+  S1 --> S2
+  S1 --> S3 --> U1 --> U2
+  U2 --> N1
+  U2 --> N2
+  N1 --> D1
+  N2 --> D1
+  D1 --> D2 --> C3
+  S2 --> C3
+  C3 --> C4 --> H4 --> H1
+  D2 --> D3
+  P3 -.-> C3

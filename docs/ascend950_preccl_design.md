@@ -1,5 +1,9 @@
 # 昇腾 950 上实现 PReCCL 式运行时拥塞检测与数据切分
 
+演示文稿：`docs/昇腾950_PReCCL运行时切分方案.pptx`  
+时序图源文件：`docs/figures/`（`d2_hop_sequence` / `d1_hop_layers` / `c_epoch_sequence` / `a_component_layers` 的 `.mmd` 与 `.svg`）
+
+
 按 HCCL 展开模式拆成两套落地路径：
 
 - **AI CPU 模式**（`AI_CPU` / `AICPU_TS`）：算子在片上 AI CPU 展开，经 STARS 下发。950PR/950DT 默认值是 `AICPU_TS`（与 `AI_CPU` 等价，后者后续废弃）。
