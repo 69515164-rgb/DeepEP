@@ -829,6 +829,55 @@ sequenceDiagram
 
 落地顺序：先 **RS→AG 相变一次**（Ring 和 HD 都能做，仍在同一次 AllReduce 内）→ 大消息 Ring 再开逐拍 → HD 不默认逐拍。
 
+### 3.7 Mesh：CCL BUFFER 切片 vs 对称内存
+
+Mesh 没有 Ring 那种 N-1 拍对端序列，但单算子路径会被 **CCL BUFFER** 切成多轮。轮次和 WQE 次数不是一回事。
+
+前提：`HCCL_BUFFSIZE` 默认 200MB，每个通信域实际占 `2 × 200MB`（CCL_In + CCL_Out）。单算子模式 Transport 建在 CCL 上，User buffer 不能被远端直接读，必须先搬进 CCL。数据量超过 `HCCL_BUFFSIZE` 时走 `CalcLoopMaxCount`：`maxCountPerLoop ≈ cclBuffSize / sizeof(dtype)`，然后 `for` 循环跑完整 Mesh。
+
+**1GB 数据、CCL=200MB（有 scratch）**
+
+```text
+AllReduce Mesh（本 rank 的 1GB 要整份过 CCL）
+  轮数 ≈ ceil(1024 / 200) = 5
+  每轮：User slice → CCL → 对 N-1 个对端各至少 1 次远端 DMA/WQE → 写回 User
+
+AllGather / ReduceScatter Mesh（CCL 里要同时放下各 rank 的一份）
+  每轮 payload 往往是 200MB / N
+  例如 N=8：每轮约 25MB，轮数 ≈ ceil(1024 / 25) ≈ 41
+```
+
+所以不是「1GB 下 1 次 WQE」。是 **5 轮（AllReduce）或更多轮（AG/RS）完整 Mesh**。每一轮内部：
+
+| 动作 | 次数（每轮） |
+| --- | --- |
+| 本地 SDMA：User ↔ CCL | 至少 1 次（不是 Jetty WQE） |
+| 远端传输：对 N-1 个邻居 | 至少 N-1 次 DMA/WQE |
+| 若本轮 slice > 单 WQE/单 DMA 上限，或开了多 VT | 每个对端再切成多条 |
+
+8 卡 AllReduce、1GB、200MB CCL：大约 `5 × (N-1) = 35` 次远端传输起步，再乘 VT 切分数。官方也写了：数据量大于 `HCCL_BUFFSIZE` 会掉性能，建议把 BUFFER 调到大于数据量——本质就是少打这几轮循环。
+
+Ping-pong 若把 200MB 拆成两半流水，每轮可用 100MB，AllReduce 轮数变成 10，WQE 更多。
+
+**对称内存 / 零拷贝（没有 CCL 中转）**
+
+`HcclCommSymWinRegister`（950 用已申请的 Device 内存注册窗口，不靠 `hcclSymWinMaxMemSizePerRank` 预留）或旧零拷贝 `SetMemoryRange + Activate`：Transport 直接建在 User buffer 上，不再 User→CCL→User。
+
+```text
+逻辑 Mesh 轮次：1 轮就能覆盖整份 1GB（没有 200MB 循环）
+WQE 次数：仍然多次，但少了「×5 轮」那一层
+```
+
+仍要多次下发的原因只剩算法和硬件，不是 scratch：
+
+1. Mesh 要对 **N-1 个对端**，每个对端至少 1 条 WQE（8 卡 AllReduce 读全量就是 7 条 1GB；RS+AG 型 Mesh 每对端约 1GB/N）。
+2. 单 WQE 长度上限、SQ 深度、多 VT/多从流切片——1GB 对一个对端也可能切成几条。
+3. 本地 reduce 仍可能按 Tile 下 SDMA，那不是远端 WQE。
+
+图模式地址固定，本来就不走 CCL 中转，和对称内存同一档：1 轮 Mesh，WQE 按对端和硬件切，不按 200MB 循环。
+
+和 3.6 的切分点：有 CCL 时，这 5 轮就是 Mesh 上可挂钩的「拍」——第 i 轮收齐后可以改第 i+1 轮的 `tile→VT`。对称内存去掉这 5 轮后，同一次 Mesh 内只剩「同一对端的多条 WQE 之间」或等到下一次集体。
+
 ---
 
 ## 4. 模式回退与一层集体两套 VT
