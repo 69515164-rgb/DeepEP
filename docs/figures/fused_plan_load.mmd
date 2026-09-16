@@ -1,0 +1,27 @@
+%% 融合 plan.bin 调用流程：API 不变，GetWorkspaceSize 按签名加载
+flowchart TB
+  subgraph offline["离线一次：生成并放到目录"]
+    SOL["求解器"] --> JSON["fused json 合同"]
+    JSON --> BIN["gmm_ar_签名.bin"]
+    JSON --> MAN["manifest.json"]
+    BIN --> DIR["MC2_FUSED_PLAN_DIR"]
+    MAN --> DIR
+  end
+
+  subgraph runtime["每次前向：框架仍调原接口"]
+    FW["框架 npu_grouped_matmul_all_reduce"]
+    API1["aclnn GetWorkspaceSize"]
+    SIG["用 x / w / groupList / dtype / 卡数算签名"]
+    HIT{"manifest 是否命中"}
+    LOAD["加载对应 .bin\n绑到 executor"]
+    STOCK["出厂路径\nHost 算 tiling\n加载芯片 kernel.o"]
+    API2["aclnn Execute"]
+    RUNP["按 bin：槽写完事件 → CCU 发"]
+    RUNS["按 kernel.o：MatMul + HcclServer"]
+
+    FW --> API1 --> SIG --> HIT
+    HIT -->|命中| LOAD --> API2 --> RUNP
+    HIT -->|未命中| STOCK --> API2 --> RUNS
+  end
+
+  DIR -.->|启动后只读盘| HIT

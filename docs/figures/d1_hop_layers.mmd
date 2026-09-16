@@ -1,0 +1,49 @@
+%% 图 D1：一次 AllReduce 内，算法拍 i → 拍间 → 拍 i+1，L0～L6
+%% 左到右时间，上到下层次。黄列只有 L2 改表。
+flowchart LR
+  subgraph start["入口"]
+    direction TB
+    e0["L0 不写表"]
+    e1["L1 Commit 一次"]
+  end
+
+  subgraph hopi["拍 i  蓝"]
+    direction TB
+    i2["L2 按 tile→VT_i 挂 chunk"]
+    i3["L3 每 VT 一条 TS"]
+    i4["L4 Jetty k doorbell"]
+    i5["L5 Channel k 出端口"]
+    i6["L6 对端收齐 Notify"]
+    i2b["L2 poll stall / bytes_done"]
+    i2 --> i3 --> i4 --> i5 --> i6 --> i2b
+  end
+
+  subgraph mid["拍间  黄  唯一改表"]
+    direction TB
+    m0["L0 不参与"]
+    m1["L1 不参与"]
+    m2["L2 Allocator 写 tile→VT_i+1"]
+    m3["L3～L6 只捎带 w_i+1"]
+    m0 --- m1 --- m2 --> m3
+  end
+
+  subgraph hopj["拍 i+1  绿"]
+    direction TB
+    j2["L2 按新表挂下一拍 Tile"]
+    j3["L3 仍下原 VT 的 TS"]
+    j4["L4 仍是 Jetty k"]
+    j5["L5 仍是 Channel k"]
+    j6["L6 角色不变 字节多少变"]
+    j2 --> j3 --> j4 --> j5 --> j6
+  end
+
+  subgraph fin["出口"]
+    direction TB
+    f1["L1 Wait 一次"]
+    f0["L0 仍不改表"]
+  end
+
+  e1 --> i2
+  i2b --> m2
+  m2 --> j2
+  j6 --> f1
